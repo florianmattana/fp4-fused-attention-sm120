@@ -1,3 +1,27 @@
 # ninja log v6
 1	838	1774001293576294784	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
 838	920	1774001294412294816	test_fp4	3819a1f73fad3cf2
+2	864	1774012057716008553	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+864	978	1774012058580008586	test_fp4	3819a1f73fad3cf2
+1	864	1774012488772024816	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+864	937	1774012489636024848	test_fp4	3819a1f73fad3cf2
+2	870	1774013033616045371	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+870	949	1774013034484045404	test_fp4	3819a1f73fad3cf2
+1	935	1774014011540082266	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+935	1016	1774014012476082301	test_fp4	3819a1f73fad3cf2
+2	1033	1774014317048093792	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+1033	1122	1774014318080093830	test_fp4	3819a1f73fad3cf2
+1	880	1774014412012097374	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+880	1000	1774014412892097407	test_fp4	3819a1f73fad3cf2
+1	947	1774014494256100477	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+947	1040	1774014495200100513	test_fp4	3819a1f73fad3cf2
+1	907	1774014534276101987	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+907	995	1774014535184102021	test_fp4	3819a1f73fad3cf2
+2	887	1774014570192103342	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+887	978	1774014571080103375	test_fp4	3819a1f73fad3cf2
+2	937	1774015601252142241	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+937	1009	1774015602188142276	test_fp4	3819a1f73fad3cf2
+1	931	1774015633188143446	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+931	1005	1774015634116143481	test_fp4	3819a1f73fad3cf2
+1	937	1774015681296145261	CMakeFiles/test_fp4.dir/tests/test_fp4.cu.o	6c2ccacab1de6cd
+938	1068	1774015682232145296	test_fp4	3819a1f73fad3cf2
