@@ -1,6 +1,8 @@
 #include <cstdio>
 #include <cstdint>
 
+#include<common.h>
+
  __global__ void test_fp4()
  {
     int lane = threadIdx.x;
