@@ -18,9 +18,17 @@ There is currently no native FP4 fused attention kernel for SM120 consumer GPUs.
 
 Work in progress. See `tests/` for validated MMA tests.
 
-Full technical writeup: [https://florianmattana.com/fp4-fused-attention-kernel-sm120]
+Full technical writeup: https://florianmattana.com/fp4-fused-attention-kernel-sm120
 
 ## Building
 
 ```bash
 make test
+
+Requires CUDA 12.8+ and an SM120 GPU.
+
+References
+gau-nernst/learn-cuda - SM120 block-scaled GEMM
+SageAttention3 - FP4 attention for SM100
+PTX ISA 9.2 - Instruction reference
+CUTLASS - NVIDIA's template library for MMA
