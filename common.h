@@ -20,3 +20,18 @@ __device__ uint8_t encode_fp4_e2m1(float val)
 
     return (uint8_t)(nibble << 2);
 }
+
+
+__device__ uint8_t compute_scale_ue8m0(float* block, int size) 
+   {
+      float max_abs = 0.0f;
+      for (int i = 0; i < size; i++) {
+         float a = fabsf(block[i]);
+         if (a > max_abs) max_abs = a;
+      }
+
+      int exponent = (int)ceilf(log2f(max_abs));
+      uint8_t ue8m0 = (uint8_t)(exponent + 127);
+
+      return ue8m0;
+   }
