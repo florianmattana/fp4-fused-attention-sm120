@@ -2,10 +2,17 @@
 
 constexpr int BQ = 64;
 constexpr int Bd = 128;
-constexpr int BLOCK_ELEMENT = 32;
+constexpr int MMA_M = 16;          
+constexpr int MMA_N = 8;           
+constexpr int MMA_K = 32;          
+constexpr int WARP_SIZE = 32;
 constexpr int NUM_THREADS = 128;
-constexpr int TILE_SIZE = BQ * Bd; // 8192 elements per tile
-constexpr int NUM_SCALE_BLOCKS = TILE_SIZE / BLOCK_ELEMENT; // 256 scaling blocks per tile
+constexpr int BLOCK_ELEMENT = 32;
+constexpr int TILE_SIZE = BQ * Bd; 
+constexpr int NUM_SCALE_BLOCKS = TILE_SIZE / BLOCK_ELEMENT;
+constexpr int ACC_PER_THREAD = 4;  
+constexpr int COL_TILES = BQ / MMA_N;
+constexpr int K_CHUNKS = Bd / MMA_K;
 
 __device__ uint8_t encode_fp4_e2m1(float val)
 {
@@ -46,7 +53,7 @@ __device__ uint8_t compute_scale_ue8m0(float* block, int size)
 
 	__global__ void fused_fp4_attention (const float* Q, const float* K, float* S)
 	{
-		__shared__ float   Q_staging[TILE_SIZE];
+		__shared__ float   staging[TILE_SIZE];
 		__shared__ uint8_t Q_quant[TILE_SIZE];
 		__shared__ uint8_t K_quant[Bd * BQ];
 		__shared__ uint8_t Q_scales[TILE_SIZE / BLOCK_ELEMENT];
@@ -58,24 +65,60 @@ __device__ uint8_t compute_scale_ue8m0(float* block, int size)
 		{
 			int idx = tid + k;
 			int g_idx = blockIdx.x * TILE_SIZE + idx;
-			Q_staging[idx] = Q[g_idx];
+			staging[idx] = Q[g_idx];
 		}
 		__syncthreads();
 
 		for (int i = tid; i < NUM_SCALE_BLOCKS; i += NUM_THREADS)
 		{
-			uint8_t scale = compute_scale_ue8m0(&Q_staging[i * BLOCK_ELEMENT], BLOCK_ELEMENT);
+			uint8_t scale = compute_scale_ue8m0(&staging[i * BLOCK_ELEMENT], BLOCK_ELEMENT);
 			Q_scales[i] = scale;
 
 			float scale_f = exp2f((float)(scale - 127));
 
 			for (int j = 0; j < BLOCK_ELEMENT; j++)
 			{
-				float val = Q_staging[i * BLOCK_ELEMENT + j] / scale_f;
+				float val = staging[i * BLOCK_ELEMENT + j] / scale_f;
 				Q_quant[i * BLOCK_ELEMENT + j] = encode_fp4_e2m1(val);
 			}
 		}
-	__syncthreads();
-	}
 
-	//test
+	__syncthreads();
+
+		for(int k = 0 ; k < TILE_SIZE ; k += NUM_THREADS)
+			{
+				int idx = tid + k;
+				int g_idx = 0 + idx;
+				staging[idx] = K[g_idx];
+			}
+		__syncthreads();
+
+		for (int i = tid; i < NUM_SCALE_BLOCKS; i += NUM_THREADS)
+		{
+			uint8_t scale = compute_scale_ue8m0(&staging[i * BLOCK_ELEMENT], BLOCK_ELEMENT);
+			K_scales[i] = scale;
+
+			float scale_f = exp2f((float)(scale - 127));
+
+			for (int j = 0; j < BLOCK_ELEMENT; j++)
+			{
+				float val = staging[i * BLOCK_ELEMENT + j] / scale_f;
+				K_quant[i * BLOCK_ELEMENT + j] = encode_fp4_e2m1(val);
+			}
+		}
+	
+	__syncthreads();
+
+		int warp_id = tid / WARP_SIZE;
+		int lane = tid % WARP_SIZE;
+
+		for (int col_tile = 0; col_tile < COL_TILES; col_tile++)
+		{
+			float acc[ACC_PER_THREAD] = {0.f};
+
+			for (int k_chunk = 0; k_chunk < K_CHUNKS; k_chunk++)
+			{
+				
+			}		
+		}
+	}
