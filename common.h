@@ -77,3 +77,5 @@ __device__ uint8_t compute_scale_ue8m0(float* block, int size)
 		}
 	__syncthreads();
 	}
+
+	//test
