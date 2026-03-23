@@ -2,6 +2,7 @@
 
 constexpr int BQ = 64;
 constexpr int Bd = 128;
+constexpr int BLOCK_ELEMENT = 32; // scaling block size: one scale factor per 32 FP4 values
 
 __device__ uint8_t encode_fp4_e2m1(float val)
 {
@@ -21,7 +22,7 @@ __device__ uint8_t encode_fp4_e2m1(float val)
 
 	 nibble |= (sign << 3);
 
-	 return (uint8_t)(nibble << 2);
+	 return (uint8_t)(nibble << 2); // shift nibble to bits [5:2] as required by MMA hardware
 }
 
 
@@ -41,25 +42,35 @@ __device__ uint8_t compute_scale_ue8m0(float* block, int size)
 
 	__global__ void MMA (const float* Q, const float* K, float* S)
 	{
-		__shared__ float Q_staging [BQ * Bd];
-		__shared__ uint8_t Q_quant[BQ][Bd];
-		__shared__ uint8_t K_quant[Bd][BQ];
-		__shared__ uint8_t Q_scales[BQ * (Bd / 32)];
-		__shared__ uint8_t K_scales[Bd * (BQ / 32)];
+		__shared__ float   Q_staging[BQ * Bd];
+		__shared__ uint8_t Q_quant[BQ * Bd];
+		__shared__ uint8_t K_quant[Bd * BQ];
+		__shared__ uint8_t Q_scales[BQ * Bd / BLOCK_ELEMENT];
+		__shared__ uint8_t K_scales[Bd * BQ / BLOCK_ELEMENT];
 
-		int lane_id = threadIdx.x;
+		int tid = threadIdx.x;
 		int NUM_THREADS = 128; 
 
 		for(int k = 0 ; k < BQ * Bd ; k += NUM_THREADS)
 		{
-			int row = (lane_id + k) / Bd;
-			int col = (lane_id + k) % Bd;
-
-			int g_row = blockIdx.x * BQ + row;
-			int g_col = col;
-
-			Q_staging[row * Bd + col] = Q[g_row * Bd + g_col];
-
+			int idx = tid + k;
+			int g_idx = blockIdx.x * BQ * Bd + idx;
+			Q_staging[idx] = Q[g_idx];
 		}
 		__syncthreads();
+
+		for (int i = tid; i < (BQ * Bd) / BLOCK_ELEMENT; i += NUM_THREADS)
+		{
+			uint8_t scale = compute_scale_ue8m0(&Q_staging[i * BLOCK_ELEMENT], BLOCK_ELEMENT);
+			Q_scales[i] = scale;
+
+			float scale_f = exp2f((float)(scale - 127));
+
+			for (int j = 0; j < BLOCK_ELEMENT; j++)
+			{
+				float val = Q_staging[i * BLOCK_ELEMENT + j] / scale_f;
+				Q_quant[i * BLOCK_ELEMENT + j] = encode_fp4_e2m1(val);
+			}
+		}
+	__syncthreads();
 	}
