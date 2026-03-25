@@ -180,6 +180,6 @@ __global__ void fused_fp4_attention (const float* Q, const float* K, float* S)
 			);
 		}
 
-		// TODO: write acc to S or apply softmax
+		
 	}
 }
