@@ -132,7 +132,9 @@ __global__ void fused_fp4_attention (const float* Q, const float* K, float* S)
 			int q_col = k_tile * MMA_K + (lane / 16) * BYTES_PER_REG;
 
 			int q_idx_0 = q_row * Bd + q_col;
-			int q_idx_1 = q_row * Bd + q_col + MMA_A_STRIDE;
+			int q_idx_1 = q_row * Bd + q_col + 16;
+			int q_idx_2 = q_row * Bd + q_col + 8;
+			int q_idx_3 = q_row * Bd + q_col + 24;
 
 			uint32_t a0 = Q_quant[q_idx_0]
 						| (Q_quant[q_idx_0 + 1] << 8)
@@ -143,6 +145,17 @@ __global__ void fused_fp4_attention (const float* Q, const float* K, float* S)
 						| (Q_quant[q_idx_1 + 1] << 8)
 						| (Q_quant[q_idx_1 + 2] << 16)
 						| (Q_quant[q_idx_1 + 3] << 24);
+
+			uint32_t a2 = Q_quant[q_idx_2]
+						| (Q_quant[q_idx_2 + 1] << 8)
+						| (Q_quant[q_idx_2 + 2] << 16)
+						| (Q_quant[q_idx_2 + 3] << 24);
+
+			uint32_t a3 = Q_quant[q_idx_3]
+						| (Q_quant[q_idx_3 + 1] << 8)
+						| (Q_quant[q_idx_3 + 2] << 16)
+						| (Q_quant[q_idx_3 + 3] << 24);
+
 
 			// Load K fragment into register b0
 			int k_row = k_tile * MMA_K + (lane % 16);
