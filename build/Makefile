@@ -129,6 +129,43 @@ test_fp4/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_fp4.dir/build.make CMakeFiles/test_fp4.dir/build
 .PHONY : test_fp4/fast
 
+#=============================================================================
+# Target rules for targets named test_attention
+
+# Build rule for target.
+test_attention: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_attention
+.PHONY : test_attention
+
+# fast build rule for target.
+test_attention/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_attention.dir/build.make CMakeFiles/test_attention.dir/build
+.PHONY : test_attention/fast
+
+tests/test_attention.o: tests/test_attention.cu.o
+.PHONY : tests/test_attention.o
+
+# target to build an object file
+tests/test_attention.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_attention.dir/build.make CMakeFiles/test_attention.dir/tests/test_attention.cu.o
+.PHONY : tests/test_attention.cu.o
+
+tests/test_attention.i: tests/test_attention.cu.i
+.PHONY : tests/test_attention.i
+
+# target to preprocess a source file
+tests/test_attention.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_attention.dir/build.make CMakeFiles/test_attention.dir/tests/test_attention.cu.i
+.PHONY : tests/test_attention.cu.i
+
+tests/test_attention.s: tests/test_attention.cu.s
+.PHONY : tests/test_attention.s
+
+# target to generate assembly for a file
+tests/test_attention.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_attention.dir/build.make CMakeFiles/test_attention.dir/tests/test_attention.cu.s
+.PHONY : tests/test_attention.cu.s
+
 tests/test_fp4.o: tests/test_fp4.cu.o
 .PHONY : tests/test_fp4.o
 
@@ -161,7 +198,11 @@ help:
 	@echo "... depend"
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
+	@echo "... test_attention"
 	@echo "... test_fp4"
+	@echo "... tests/test_attention.o"
+	@echo "... tests/test_attention.i"
+	@echo "... tests/test_attention.s"
 	@echo "... tests/test_fp4.o"
 	@echo "... tests/test_fp4.i"
 	@echo "... tests/test_fp4.s"
