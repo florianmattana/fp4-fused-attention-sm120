@@ -2,51 +2,40 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// ── Tile and MMA geometry ─────────────────────────────────────────────────────
-constexpr int BQ            = 64;    // Q tile rows (tokens)
-constexpr int Bd            = 128;   // head dimension
-constexpr int MMA_M         = 16;    // MMA tile rows
-constexpr int MMA_N         = 8;     // MMA tile cols
-constexpr int MMA_K         = 32;    // MMA reduction dimension (8-bit containers)
+// ── Fixed MMA geometry ────────────────────────────────────────────────────────
+constexpr int MMA_M         = 16;
+constexpr int MMA_N         = 8;
+constexpr int MMA_K         = 32;
 
 // ── Thread configuration ──────────────────────────────────────────────────────
 constexpr int WARP_SIZE     = 32;
-constexpr int NUM_THREADS   = 128;   // 4 warps × 32 threads, one warp per 16 output rows
+constexpr int NUM_THREADS   = 128;   // 4 warps × 32 threads
 
 // ── Quantization ──────────────────────────────────────────────────────────────
-constexpr int BLOCK_ELEMENT = 32;    // elements per UE8M0 scale block (scale_vec::1X)
+constexpr int BLOCK_ELEMENT = 32;
 
-// ── Derived constants ─────────────────────────────────────────────────────────
-constexpr int ACC_PER_THREAD   = 4;               // FP32 accumulators per thread per MMA
-constexpr int TILE_SIZE        = BQ * Bd;          // 64×128 = 8192 elements per tile
-constexpr int N_TILES          = BQ / MMA_N;       // 8 column tiles covering 64 cols of S
-constexpr int K_TILES          = Bd / MMA_K;       // 4 k-chunks covering 128 head dims
-constexpr int NUM_SCALE_BLOCKS = TILE_SIZE / BLOCK_ELEMENT;  // 256 scale factors per tile
-constexpr int BYTES_PER_REG    = 4;               // 4 FP4 containers per 32-bit register
+// ── Fixed Q tile ──────────────────────────────────────────────────────────────
+constexpr int BQ            = 64;
 
 // ── FP4 E2M1 encoding ─────────────────────────────────────────────────────────
-// Container format: 00_SEMM_00 — nibble in bits 5-2 of the 8-bit byte
-// UE8M0 scale: byte value = exponent + 127, actual scale = 2^(byte-127)
 __device__ inline uint8_t encode_fp4_e2m1(float val)
 {
     uint8_t sign = (val < 0.f) ? 1 : 0;
     float abs_val = fabsf(val);
     uint8_t nibble;
-    if      (abs_val >= 5.0f)  nibble = 0x7;   // → 6.0
-    else if (abs_val >= 3.5f)  nibble = 0x6;   // → 4.0
-    else if (abs_val >= 2.5f)  nibble = 0x5;   // → 3.0
-    else if (abs_val >= 1.75f) nibble = 0x4;   // → 2.0
-    else if (abs_val >= 1.25f) nibble = 0x3;   // → 1.5
-    else if (abs_val >= 0.75f) nibble = 0x2;   // → 1.0
-    else if (abs_val >= 0.25f) nibble = 0x1;   // → 0.5
-    else                       nibble = 0x0;   // → 0.0
+    if      (abs_val >= 5.0f)  nibble = 0x7;
+    else if (abs_val >= 3.5f)  nibble = 0x6;
+    else if (abs_val >= 2.5f)  nibble = 0x5;
+    else if (abs_val >= 1.75f) nibble = 0x4;
+    else if (abs_val >= 1.25f) nibble = 0x3;
+    else if (abs_val >= 0.75f) nibble = 0x2;
+    else if (abs_val >= 0.25f) nibble = 0x1;
+    else                       nibble = 0x0;
     nibble |= (sign << 3);
-    return (uint8_t)(nibble << 2);  // place nibble in bits 5-2
+    return (uint8_t)(nibble << 2);
 }
 
 // ── UE8M0 block scale computation ────────────────────────────────────────────
-// Finds smallest power-of-two >= max(|block|), returns as UE8M0 byte
-// Rounding up avoids saturation on the largest values
 __device__ inline uint8_t compute_scale_ue8m0(float* block)
 {
     float max_abs = 0.0f;
@@ -59,48 +48,70 @@ __device__ inline uint8_t compute_scale_ue8m0(float* block)
 }
 
 // ── Fused FP4 attention kernel ────────────────────────────────────────────────
-// Computes Out = softmax(Q×Kᵀ / sqrt(d)) × V
-// Q  : [BQ  × Bd]    float32, one Q tile (64 tokens)
-// K  : [seq_k × Bd]  float32, full key sequence
-// Out: [BQ  × MMA_N] float32, attention output
-// V  : [seq_k × MMA_N] float32, value sequence
-// seq_k: total number of K tokens (must be multiple of BQ)
+// Computes Out = softmax(Q×Kᵀ / sqrt(HEAD_DIM)) × V
 //
-// Shared memory layout (~49 KiB, fits within 99 KiB SM120 optin budget):
-//   staging [TILE_SIZE]        = 32 KB  reusable FP32 load buffer
-//   Q_quant [TILE_SIZE]        =  8 KB  Q tile after FP4 quantization
-//   K_quant [TILE_SIZE]        =  8 KB  K tile after FP4 quantization
-//   Q_scales[NUM_SCALE_BLOCKS] = 256 B  one UE8M0 scale per 32 Q elements
-//   K_scales[NUM_SCALE_BLOCKS] = 256 B  one UE8M0 scale per 32 K elements
+// Tensor layout (all row-major):
+//   Q   : [batch, heads, seq_q, HEAD_DIM]
+//   K   : [batch, heads, seq_k, HEAD_DIM]
+//   V   : [batch, heads, seq_k, HEAD_DIM]
+//   Out : [batch, heads, seq_q, HEAD_DIM]
+//
+// Launch: <<<batch * heads, NUM_THREADS>>>
+//
+// Constraints:
+//   HEAD_DIM must be a multiple of MMA_K (32): 64, 96, 128, 160...
+//   seq_k must be a multiple of BQ (64)
+//
+// O accumulator layout per thread:
+//   Each thread owns rows (q_row0, q_row1) and HEAD_DIM/4 output column pairs.
+//   O_SIZE = HEAD_DIM/4 pairs × 2 rows = HEAD_DIM/2 floats total.
+//   For HEAD_DIM=128: 64 floats → comfortable register usage.
+template<int HEAD_DIM>
 __global__ void fused_fp4_attention(
-    const float* Q,
-    const float* K,
-    float*       Out,
-    const float* V,
-    int          seq_k)
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    float*       __restrict__ Out,
+    const float* __restrict__ V,
+    int seq_q,
+    int seq_k,
+    int heads)
 {
+    // ── Compile-time constants ────────────────────────────────────────────────
+    constexpr int TILE_SIZE        = BQ * HEAD_DIM;
+    constexpr int K_TILES          = HEAD_DIM / MMA_K;    // chunks along head dim
+    constexpr int N_TILES          = BQ / MMA_N;          // col tiles of S (= BQ/8)
+    constexpr int V_COL_TILES      = HEAD_DIM / MMA_N;    // output col tiles
+    constexpr int O_SIZE           = V_COL_TILES * 2;     // floats per row per thread
+    constexpr int NUM_SCALE_BLOCKS = TILE_SIZE / BLOCK_ELEMENT;
+    constexpr int BYTES_PER_REG    = 4;
+
+    // ── Shared memory ─────────────────────────────────────────────────────────
     __shared__ float   staging [TILE_SIZE];
     __shared__ uint8_t Q_quant [TILE_SIZE];
     __shared__ uint8_t K_quant [TILE_SIZE];
     __shared__ uint8_t Q_scales[NUM_SCALE_BLOCKS];
     __shared__ uint8_t K_scales[NUM_SCALE_BLOCKS];
 
+    // ── Block → (batch, head) mapping ────────────────────────────────────────
+    int batch_idx = blockIdx.x / heads;
+    int head_idx  = blockIdx.x % heads;
+
+    int q_base   = batch_idx * heads * seq_q * HEAD_DIM + head_idx * seq_q * HEAD_DIM;
+    int k_base   = batch_idx * heads * seq_k * HEAD_DIM + head_idx * seq_k * HEAD_DIM;
+    int v_base_g = batch_idx * heads * seq_k * HEAD_DIM + head_idx * seq_k * HEAD_DIM;
+    int o_base   = batch_idx * heads * seq_q * HEAD_DIM + head_idx * seq_q * HEAD_DIM;
+
     int tid     = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
     int lane    = tid % WARP_SIZE;
 
-    // ── Load and quantize Q (once, before the K tile loop) ───────────────────
-    // Strided load: each thread takes elements tid, tid+128, tid+256, ...
-    // guarantees coalesced access (consecutive threads → consecutive addresses)
+    // ── Load and quantize Q ───────────────────────────────────────────────────
     for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) {
         int idx   = tid + k;
-        int g_idx = blockIdx.x * TILE_SIZE + idx;
-        staging[idx] = Q[g_idx];
+        staging[idx] = Q[q_base + idx];
     }
     __syncthreads();
 
-    // Two-pass quantization: load FP32 first (need full block for scale),
-    // then encode. 256 blocks / 128 threads = 2 blocks per thread.
     for (int i = tid; i < NUM_SCALE_BLOCKS; i += NUM_THREADS) {
         uint8_t scale = compute_scale_ue8m0(&staging[i * BLOCK_ELEMENT]);
         Q_scales[i]   = scale;
@@ -112,36 +123,35 @@ __global__ void fused_fp4_attention(
     }
     __syncthreads();
 
-    // ── Fragment layout (empirically validated — see article sections 12-15) ─
+    // ── Fragment layout (empirically validated — sections 12-15) ─────────────
     // lane/4  → row base within warp tile (0..7)
-    // lane%4  → K-column subgroup (stride 4)
+    // lane%4  → K-column subgroup and output-column subgroup (0..3)
     // a0=(r0,c), a1=(r0+8,c), a2=(r0,c+16), a3=(r0+8,c+16)
-    // scale_a: lane%4==0 → row0, lane%4==1 → row0+8
-    // scale_b: lane%4==0 → K token (col of B)
-    int q_row0  = warp_id * MMA_M + (lane / 4);
-    int q_row1  = q_row0 + 8;
-    int out_col = (lane % 4) * 2;
+    int q_row0 = warp_id * MMA_M + (lane / 4);
+    int q_row1 = q_row0 + 8;
 
-    // ── Online softmax state (persists across all K tiles) ───────────────────
-    // m = running max, l = running sum of exp, O = running output
-    // Each thread owns 2 output positions: (q_row0, out_col) and (q_row1, out_col)
-    float m0 = -INFINITY, l0 = 0.f, O0_c0 = 0.f, O0_c1 = 0.f;
-    float m1 = -INFINITY, l1 = 0.f, O1_c0 = 0.f, O1_c1 = 0.f;
+    const float softmax_scale = 1.0f / sqrtf((float)HEAD_DIM);
+
+    // ── O accumulator array (unnormalized) ───────────────────────────────────
+    // O0[v_col_tile*2 + 0] = output col v_col_tile*MMA_N + (lane%4)*2     for row0
+    // O0[v_col_tile*2 + 1] = output col v_col_tile*MMA_N + (lane%4)*2 + 1 for row0
+    float O0[O_SIZE];
+    float O1[O_SIZE];
+    #pragma unroll
+    for (int t = 0; t < O_SIZE; t++) { O0[t] = 0.f; O1[t] = 0.f; }
+
+    // ── Softmax state (scalar — same for all output columns) ─────────────────
+    float m0 = -INFINITY, l0 = 0.f;
+    float m1 = -INFINITY, l1 = 0.f;
 
     int num_seq_tiles = seq_k / BQ;
 
-    const float softmax_scale = 1.0f / sqrtf((float)Bd);
-
     // ── K tile loop ───────────────────────────────────────────────────────────
-    // Each iteration loads one [BQ × Bd] tile of K, computes partial S scores,
-    // and updates the online softmax state
     for (int seq_tile = 0; seq_tile < num_seq_tiles; seq_tile++)
     {
-        // Load K tile into staging (reuses Q's FP32 buffer — Q is already
-        // safely stored in Q_quant)
         for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) {
             int idx   = tid + k;
-            int g_idx = seq_tile * TILE_SIZE + idx;
+            int g_idx = k_base + seq_tile * TILE_SIZE + idx;
             staging[idx] = K[g_idx];
         }
         __syncthreads();
@@ -157,21 +167,18 @@ __global__ void fused_fp4_attention(
         }
         __syncthreads();
 
-        // ── MMA loop over column tiles of S ───────────────────────────────────
-        // Outer: n_tile covers 8 col fragments (8 × 8 cols = 64 cols of S)
-        // Inner: k_tile accumulates 4 chunks along head dim (4 × 32 = 128)
+        // ── MMA: compute S tile ───────────────────────────────────────────────
         for (int n_tile = 0; n_tile < N_TILES; n_tile++)
         {
-            float acc[ACC_PER_THREAD] = {0.f};
+            float acc[4] = {0.f};
 
             for (int k_tile = 0; k_tile < K_TILES; k_tile++)
             {
-                // A fragment: Q rows q_row0 and q_row1, K-cols from k_tile chunk
                 int q_col_base = k_tile * MMA_K + (lane % 4) * BYTES_PER_REG;
-                int qi0 = q_row0 * Bd + q_col_base;
-                int qi1 = q_row1 * Bd + q_col_base;
-                int qi2 = q_row0 * Bd + q_col_base + 16;
-                int qi3 = q_row1 * Bd + q_col_base + 16;
+                int qi0 = q_row0 * HEAD_DIM + q_col_base;
+                int qi1 = q_row1 * HEAD_DIM + q_col_base;
+                int qi2 = q_row0 * HEAD_DIM + q_col_base + 16;
+                int qi3 = q_row1 * HEAD_DIM + q_col_base + 16;
 
                 auto pack = [&](int base) -> uint32_t {
                     return (uint32_t)Q_quant[base]
@@ -180,16 +187,13 @@ __global__ void fused_fp4_attention(
                          | ((uint32_t)Q_quant[base+3] << 24);
                 };
 
-                uint32_t a0 = pack(qi0);
-                uint32_t a1 = pack(qi1);
-                uint32_t a2 = pack(qi2);
-                uint32_t a3 = pack(qi3);
+                uint32_t a0 = pack(qi0), a1 = pack(qi1);
+                uint32_t a2 = pack(qi2), a3 = pack(qi3);
 
-                // B fragment: K token k_n, head-dim range from k_tile chunk
                 int k_n      = n_tile * MMA_N + (lane / 4);
                 int k_k_base = k_tile * MMA_K + (lane % 4) * BYTES_PER_REG;
-                int ki0 = k_n * Bd + k_k_base;
-                int ki1 = k_n * Bd + k_k_base + 16;
+                int ki0 = k_n * HEAD_DIM + k_k_base;
+                int ki1 = k_n * HEAD_DIM + k_k_base + 16;
 
                 auto packK = [&](int base) -> uint32_t {
                     return (uint32_t)K_quant[base]
@@ -198,14 +202,11 @@ __global__ void fused_fp4_attention(
                          | ((uint32_t)K_quant[base+3] << 24);
                 };
 
-                uint32_t b0 = packK(ki0);
-                uint32_t b1 = packK(ki1);
+                uint32_t b0 = packK(ki0), b1 = packK(ki1);
 
-                // Scale A: lane%4==0 → q_row0, lane%4==1 → q_row1
-                // Scale B: lane%4==0 → k_n (hardware ignores other lanes)
                 int sa_row = ((lane % 4) == 1) ? q_row1 : q_row0;
-                uint8_t sa = Q_scales[sa_row * (Bd / BLOCK_ELEMENT) + k_tile];
-                uint8_t sb = K_scales[k_n   * (Bd / BLOCK_ELEMENT) + k_tile];
+                uint8_t sa = Q_scales[sa_row * (HEAD_DIM / BLOCK_ELEMENT) + k_tile];
+                uint8_t sb = K_scales[k_n    * (HEAD_DIM / BLOCK_ELEMENT) + k_tile];
 
                 uint32_t scale_a = (uint32_t)sa;
                 uint32_t scale_b = (uint32_t)sb;
@@ -223,18 +224,16 @@ __global__ void fused_fp4_attention(
                 );
             }
 
-            // ── Apply 1/sqrt(d) scaling before softmax ────────────────────────
-            for (int i = 0; i < ACC_PER_THREAD; i++)
-                acc[i] *= softmax_scale;;
+            // Apply 1/sqrt(d) before softmax
+            for (int i = 0; i < 4; i++) acc[i] *= softmax_scale;
 
-            // ── Online softmax update — row0 ───────────────────────────────────
-            // Butterfly reduce (2 rounds) to collect row max across 4 lanes
+            // ── Online softmax row0 ───────────────────────────────────────────
             float local_max0 = fmaxf(acc[0], acc[1]);
             local_max0 = fmaxf(local_max0, __shfl_xor_sync(0xFFFFFFFF, local_max0, 1));
             local_max0 = fmaxf(local_max0, __shfl_xor_sync(0xFFFFFFFF, local_max0, 2));
 
             float new_m0 = fmaxf(m0, local_max0);
-            float alpha0 = expf(m0 - new_m0);   // rescale factor for previous O
+            float alpha0 = expf(m0 - new_m0);
             float e0_c0  = expf(acc[0] - new_m0);
             float e0_c1  = expf(acc[1] - new_m0);
 
@@ -243,7 +242,7 @@ __global__ void fused_fp4_attention(
             local_sum0 += __shfl_xor_sync(0xFFFFFFFF, local_sum0, 2);
             float new_l0 = alpha0 * l0 + local_sum0;
 
-            // ── Online softmax update — row1 (q_row0+8) ───────────────────────
+            // ── Online softmax row1 ───────────────────────────────────────────
             float local_max1 = fmaxf(acc[2], acc[3]);
             local_max1 = fmaxf(local_max1, __shfl_xor_sync(0xFFFFFFFF, local_max1, 1));
             local_max1 = fmaxf(local_max1, __shfl_xor_sync(0xFFFFFFFF, local_max1, 2));
@@ -258,67 +257,90 @@ __global__ void fused_fp4_attention(
             local_sum1 += __shfl_xor_sync(0xFFFFFFFF, local_sum1, 2);
             float new_l1 = alpha1 * l1 + local_sum1;
 
-            // ── V accumulation ────────────────────────────────────────────────
-            // Each thread collects softmax weights from its 4 lane neighbors via
-            // shfl_sync, then accumulates their V contributions into its own
-            // output columns. v_tok = absolute token index in the full V sequence.
-            float p0_c0 = 0.f, p0_c1 = 0.f;
-            float p1_c0 = 0.f, p1_c1 = 0.f;
-
-            for (int i = 0; i < 4; i++) {
-                int src       = (lane / 4) * 4 + i;
-                int local_tok = n_tile * MMA_N + i * 2;
-                int v_tok     = seq_tile * BQ + local_tok;  // absolute V token index
-
-                float se0 = __shfl_sync(0xFFFFFFFF, e0_c0, src);
-                float se1 = __shfl_sync(0xFFFFFFFF, e0_c1, src);
-                float se2 = __shfl_sync(0xFFFFFFFF, e1_c0, src);
-                float se3 = __shfl_sync(0xFFFFFFFF, e1_c1, src);
-
-                p0_c0 += se0 * V[v_tok       * MMA_N + out_col]
-                       + se1 * V[(v_tok + 1)  * MMA_N + out_col];
-                p0_c1 += se0 * V[v_tok       * MMA_N + out_col + 1]
-                       + se1 * V[(v_tok + 1)  * MMA_N + out_col + 1];
-                p1_c0 += se2 * V[v_tok       * MMA_N + out_col]
-                       + se3 * V[(v_tok + 1)  * MMA_N + out_col];
-                p1_c1 += se2 * V[v_tok       * MMA_N + out_col + 1]
-                       + se3 * V[(v_tok + 1)  * MMA_N + out_col + 1];
+            // ── Rescale all O values when m changes ───────────────────────────
+            // Must apply to ALL output columns — this is why O is an array
+            #pragma unroll
+            for (int t = 0; t < O_SIZE; t++) {
+                O0[t] *= alpha0;
+                O1[t] *= alpha1;
             }
 
-            // Normalized online softmax output update
-            O0_c0 = (alpha0 * l0 * O0_c0 + p0_c0) / new_l0;
-            O0_c1 = (alpha0 * l0 * O0_c1 + p0_c1) / new_l0;
-            m0 = new_m0;
-            l0 = new_l0;
+            // ── Fetch softmax weights from lane neighbors (once per n_tile) ───
+            // se0/se1 for row0, se2/se3 for row1 — same for ALL output col tiles
+            float se0[4], se1[4], se2[4], se3[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int src = (lane / 4) * 4 + i;
+                se0[i] = __shfl_sync(0xFFFFFFFF, e0_c0, src);
+                se1[i] = __shfl_sync(0xFFFFFFFF, e0_c1, src);
+                se2[i] = __shfl_sync(0xFFFFFFFF, e1_c0, src);
+                se3[i] = __shfl_sync(0xFFFFFFFF, e1_c1, src);
+            }
 
-            O1_c0 = (alpha1 * l1 * O1_c0 + p1_c0) / new_l1;
-            O1_c1 = (alpha1 * l1 * O1_c1 + p1_c1) / new_l1;
-            m1 = new_m1;
-            l1 = new_l1;
+            // ── V accumulation across ALL output column tiles ─────────────────
+            // Each v_col_tile covers 8 output columns (MMA_N).
+            // This thread contributes to columns v_col_tile*MMA_N + (lane%4)*2
+            // and v_col_tile*MMA_N + (lane%4)*2 + 1
+            #pragma unroll
+            for (int vt = 0; vt < V_COL_TILES; vt++) {
+                int out_c = vt * MMA_N + (lane % 4) * 2;
+                float p0_c0 = 0.f, p0_c1 = 0.f;
+                float p1_c0 = 0.f, p1_c1 = 0.f;
+
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    int local_tok = n_tile * MMA_N + i * 2;
+                    int v_tok     = seq_tile * BQ + local_tok;
+                    int vrow0     = v_base_g + v_tok       * HEAD_DIM;
+                    int vrow1     = v_base_g + (v_tok + 1) * HEAD_DIM;
+
+                    p0_c0 += se0[i] * V[vrow0 + out_c]     + se1[i] * V[vrow1 + out_c];
+                    p0_c1 += se0[i] * V[vrow0 + out_c + 1] + se1[i] * V[vrow1 + out_c + 1];
+                    p1_c0 += se2[i] * V[vrow0 + out_c]     + se3[i] * V[vrow1 + out_c];
+                    p1_c1 += se2[i] * V[vrow0 + out_c + 1] + se3[i] * V[vrow1 + out_c + 1];
+                }
+
+                O0[vt * 2]     += p0_c0;
+                O0[vt * 2 + 1] += p0_c1;
+                O1[vt * 2]     += p1_c0;
+                O1[vt * 2 + 1] += p1_c1;
+            }
+
+            m0 = new_m0; l0 = new_l0;
+            m1 = new_m1; l1 = new_l1;
         }
 
-        // Release staging buffer before next tile's load
         __syncthreads();
     }
 
-    // ── Write output ──────────────────────────────────────────────────────────
-    Out[q_row0 * MMA_N + out_col]     = O0_c0;
-    Out[q_row0 * MMA_N + out_col + 1] = O0_c1;
-    Out[q_row1 * MMA_N + out_col]     = O1_c0;
-    Out[q_row1 * MMA_N + out_col + 1] = O1_c1;
+    // ── Normalize O by l and write output ─────────────────────────────────────
+    int out_base0 = o_base + q_row0 * HEAD_DIM;
+    int out_base1 = o_base + q_row1 * HEAD_DIM;
+
+    #pragma unroll
+    for (int vt = 0; vt < V_COL_TILES; vt++) {
+        int out_c = vt * MMA_N + (lane % 4) * 2;
+        Out[out_base0 + out_c]     = O0[vt * 2]     / l0;
+        Out[out_base0 + out_c + 1] = O0[vt * 2 + 1] / l0;
+        Out[out_base1 + out_c]     = O1[vt * 2]     / l1;
+        Out[out_base1 + out_c + 1] = O1[vt * 2 + 1] / l1;
+    }
 }
 
-// ── Debug kernel: validates S = Q×Kᵀ fragment layout ────────────────────────
-// Loads directly from global memory, no shared memory, scales hardcoded to 1.0
-// Used for the identity matrix test in section 11
+// ── Debug kernel ──────────────────────────────────────────────────────────────
 __global__ void debug_mma(const float* Q, const float* K, float* S_out)
 {
+    constexpr int HEAD_DIM      = 128;
+    constexpr int K_TILES       = HEAD_DIM / MMA_K;
+    constexpr int N_TILES_DBG   = BQ / MMA_N;
+    constexpr int BYTES_PER_REG = 4;
+
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane    = threadIdx.x % WARP_SIZE;
     int q_row0  = warp_id * MMA_M + (lane / 4);
     int q_row1  = q_row0 + 8;
 
-    for (int n_tile = 0; n_tile < N_TILES; n_tile++)
+    for (int n_tile = 0; n_tile < N_TILES_DBG; n_tile++)
     {
         int out_col = n_tile * MMA_N + (lane % 4) * 2;
         float acc[4] = {0.f};
@@ -326,10 +348,10 @@ __global__ void debug_mma(const float* Q, const float* K, float* S_out)
         for (int k_tile = 0; k_tile < K_TILES; k_tile++)
         {
             int q_col_base = k_tile * MMA_K + (lane % 4) * BYTES_PER_REG;
-            int qi0 = q_row0 * Bd + q_col_base;
-            int qi1 = q_row1 * Bd + q_col_base;
-            int qi2 = q_row0 * Bd + q_col_base + 16;
-            int qi3 = q_row1 * Bd + q_col_base + 16;
+            int qi0 = q_row0 * HEAD_DIM + q_col_base;
+            int qi1 = q_row1 * HEAD_DIM + q_col_base;
+            int qi2 = q_row0 * HEAD_DIM + q_col_base + 16;
+            int qi3 = q_row1 * HEAD_DIM + q_col_base + 16;
 
             auto pack = [&](int base) -> uint32_t {
                 return encode_fp4_e2m1(Q[base])
@@ -343,8 +365,8 @@ __global__ void debug_mma(const float* Q, const float* K, float* S_out)
 
             int k_n      = n_tile * MMA_N + (lane / 4);
             int k_k_base = k_tile * MMA_K + (lane % 4) * BYTES_PER_REG;
-            int ki0 = k_n * Bd + k_k_base;
-            int ki1 = k_n * Bd + k_k_base + 16;
+            int ki0 = k_n * HEAD_DIM + k_k_base;
+            int ki1 = k_n * HEAD_DIM + k_k_base + 16;
 
             auto packK = [&](int base) -> uint32_t {
                 return encode_fp4_e2m1(K[base])
