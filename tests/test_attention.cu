@@ -4,11 +4,12 @@
 #include <cuda_runtime.h>
 #include <common.h>
 
-static constexpr int SEQ  = BQ;
-static constexpr int HEAD = Bd;
-static constexpr int VCOL = MMA_N;
+static constexpr int SEQ_Q = BQ;
+static constexpr int HEAD  = Bd;
+static constexpr int VCOL  = MMA_N;
 
-void cpu_matmul(const float* A, const float* B, float* C, int M, int N, int K)
+void cpu_matmul(const float* A, const float* B, float* C,
+                int M, int N, int K)
 {
     for (int i = 0; i < M; i++)
         for (int j = 0; j < N; j++) {
@@ -32,18 +33,26 @@ void cpu_softmax_rows(float* S, int rows, int cols)
 }
 
 void cpu_attention(const float* Q, const float* K, const float* V,
-                   float* Out, int seq, int head, int vcol)
+                   float* Out, int seq_q, int seq_k, int head, int vcol)
 {
-    float* S  = new float[seq * seq];
-    float* Kt = new float[seq * head];
-    for (int i = 0; i < seq; i++)
+    float* Kt = new float[seq_k * head];
+    float* S  = new float[seq_q * seq_k];
+
+    for (int i = 0; i < seq_k; i++)
         for (int j = 0; j < head; j++)
-            Kt[j*seq + i] = K[i*head + j];
-    cpu_matmul(Q, Kt, S, seq, seq, head);
-    cpu_softmax_rows(S, seq, seq);
-    cpu_matmul(S, V, Out, seq, vcol, seq);
-    delete[] S;
+            Kt[j * seq_k + i] = K[i * head + j];
+
+    cpu_matmul(Q, Kt, S, seq_q, seq_k, head);
+
+    // 1/sqrt(d) scaling — must match GPU kernel
+    float scale = 1.0f / sqrtf((float)head);
+    for (int i = 0; i < seq_q * seq_k; i++) S[i] *= scale;
+
+    cpu_softmax_rows(S, seq_q, seq_k);
+    cpu_matmul(S, V, Out, seq_q, vcol, seq_k);
+
     delete[] Kt;
+    delete[] S;
 }
 
 float cosine_similarity(const float* a, const float* b, int n)
@@ -57,48 +66,54 @@ float cosine_similarity(const float* a, const float* b, int n)
     return dot / (sqrtf(na) * sqrtf(nb) + 1e-8f);
 }
 
-void test_attention()
+void test_attention(int seq_k)
 {
-    printf("\n=== test fused_fp4_attention ===\n");
+    printf("\n=== test fused_fp4_attention  seq_q=%d  seq_k=%d ===\n",
+           SEQ_Q, seq_k);
 
-    float* Q   = new float[SEQ * HEAD];
-    float* K   = new float[SEQ * HEAD];
-    float* V   = new float[SEQ * VCOL];
-    float* ref = new float[SEQ * VCOL];
-    float* out = new float[SEQ * VCOL];
+    float* Q   = new float[SEQ_Q * HEAD];
+    float* K   = new float[seq_k * HEAD];
+    float* V   = new float[seq_k * VCOL];
+    float* ref = new float[SEQ_Q * VCOL];
+    float* out = new float[SEQ_Q * VCOL];
 
-srand(42);
-auto rnd = []{ 
-    float vals[] = {-1.f, -0.5f, 0.f, 0.5f, 1.f};
-    return vals[rand() % 5]; 
-};
-for (int i = 0; i < SEQ * HEAD; i++) { Q[i] = rnd(); K[i] = rnd(); }
-for (int i = 0; i < SEQ * VCOL; i++) V[i] = rnd();
+    srand(42);
+    auto rnd = []{
+        float vals[] = {-1.f, -0.5f, 0.f, 0.5f, 1.f};
+        return vals[rand() % 5];
+    };
+    for (int i = 0; i < SEQ_Q * HEAD; i++) Q[i] = rnd();
+    for (int i = 0; i < seq_k * HEAD; i++) K[i] = rnd();
+    for (int i = 0; i < seq_k * VCOL; i++) V[i] = rnd();
 
-    cpu_attention(Q, K, V, ref, SEQ, HEAD, VCOL);
+    cpu_attention(Q, K, V, ref, SEQ_Q, seq_k, HEAD, VCOL);
 
     float *dQ, *dK, *dV, *dOut;
-    cudaMalloc(&dQ,   SEQ * HEAD * sizeof(float));
-    cudaMalloc(&dK,   SEQ * HEAD * sizeof(float));
-    cudaMalloc(&dV,   SEQ * VCOL * sizeof(float));
-    cudaMalloc(&dOut, SEQ * VCOL * sizeof(float));
-    cudaMemcpy(dQ, Q, SEQ * HEAD * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dK, K, SEQ * HEAD * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dV, V, SEQ * VCOL * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMalloc(&dQ,   SEQ_Q * HEAD * sizeof(float));
+    cudaMalloc(&dK,   seq_k * HEAD * sizeof(float));
+    cudaMalloc(&dV,   seq_k * VCOL * sizeof(float));
+    cudaMalloc(&dOut, SEQ_Q * VCOL * sizeof(float));
+    cudaMemcpy(dQ, Q, SEQ_Q * HEAD * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dK, K, seq_k * HEAD * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dV, V, seq_k * VCOL * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(dOut, 0, SEQ_Q * VCOL * sizeof(float));
 
-    fused_fp4_attention<<<1, NUM_THREADS>>>(dQ, dK, dOut, dV);
+    fused_fp4_attention<<<1, NUM_THREADS>>>(dQ, dK, dOut, dV, seq_k);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        printf("kernel launch error: %s\n", cudaGetErrorString(err));
     cudaDeviceSynchronize();
 
-    cudaMemcpy(out, dOut, SEQ * VCOL * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out, dOut, SEQ_Q * VCOL * sizeof(float), cudaMemcpyDeviceToHost);
 
-    float cos_sim = cosine_similarity(ref, out, SEQ * VCOL);
+    float cos_sim = cosine_similarity(ref, out, SEQ_Q * VCOL);
     printf("cosine similarity : %.4f\n", cos_sim);
     printf("%s (seuil 0.99)\n", cos_sim >= 0.99f ? "PASS" : "FAIL");
 
     printf("ref[0..7] : ");
     for (int i = 0; i < 8; i++) printf("%.3f ", ref[i]);
-    printf("\n");
-    printf("out[0..7] : ");
+    printf("\nout[0..7] : ");
     for (int i = 0; i < 8; i++) printf("%.3f ", out[i]);
     printf("\n");
 
@@ -108,6 +123,7 @@ for (int i = 0; i < SEQ * VCOL; i++) V[i] = rnd();
 
 int main()
 {
-    test_attention();
+    test_attention(BQ);   // seq_k=64  — régression sur le cas original
+    test_attention(128);  // seq_k=128 — valide la boucle K tile
     return 0;
 }
