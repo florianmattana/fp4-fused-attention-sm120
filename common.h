@@ -9,7 +9,7 @@ constexpr int MMA_K         = 32;
 
 // ── Thread configuration ──────────────────────────────────────────────────────
 constexpr int WARP_SIZE     = 32;
-constexpr int NUM_THREADS   = 128;   // 4 warps × 32 threads
+constexpr int NUM_THREADS   = 128;
 
 // ── Quantization ──────────────────────────────────────────────────────────────
 constexpr int BLOCK_ELEMENT = 32;
@@ -47,25 +47,24 @@ __device__ inline uint8_t compute_scale_ue8m0(float* block)
     return (uint8_t)(exponent + 127);
 }
 
-// ── Fused FP4 attention kernel ────────────────────────────────────────────────
+// ── Fused FP4 attention kernel with V in shared memory ────────────────────────
 // Computes Out = softmax(Q×Kᵀ / sqrt(HEAD_DIM)) × V
 //
-// Tensor layout (all row-major):
-//   Q   : [batch, heads, seq_q, HEAD_DIM]
-//   K   : [batch, heads, seq_k, HEAD_DIM]
-//   V   : [batch, heads, seq_k, HEAD_DIM]
-//   Out : [batch, heads, seq_q, HEAD_DIM]
+// Key change vs previous version: V tile loaded into shared memory each seq_tile.
+// This eliminates the long scoreboard stall from repeated global memory V accesses.
+// Double buffering for K removed to fit V in the 99 KiB SM120 budget.
 //
-// Launch: <<<batch * heads, NUM_THREADS>>>
+// Shared memory layout (~80 KiB for HEAD_DIM=128):
+//   staging [BQ * HEAD_DIM]        = 32 KB  K tile load buffer (float32)
+//   Q_quant [BQ * HEAD_DIM]        =  8 KB  Q after FP4 quantization
+//   K_quant [BQ * HEAD_DIM]        =  8 KB  K after FP4 quantization
+//   V_tile  [BQ * HEAD_DIM]        = 32 KB  V tile (float32, read from SMEM)
+//   Q_scales[BQ*HEAD_DIM/32]       = 256 B
+//   K_scales[BQ*HEAD_DIM/32]       = 256 B
 //
 // Constraints:
-//   HEAD_DIM must be a multiple of MMA_K (32): 64, 96, 128, 160...
+//   HEAD_DIM must be a multiple of MMA_K (32): 64, 96, 128...
 //   seq_k must be a multiple of BQ (64)
-//
-// O accumulator layout per thread:
-//   Each thread owns rows (q_row0, q_row1) and HEAD_DIM/4 output column pairs.
-//   O_SIZE = HEAD_DIM/4 pairs × 2 rows = HEAD_DIM/2 floats total.
-//   For HEAD_DIM=128: 64 floats → comfortable register usage.
 template<int HEAD_DIM>
 __global__ void fused_fp4_attention(
     const float* __restrict__ Q,
@@ -78,17 +77,18 @@ __global__ void fused_fp4_attention(
 {
     // ── Compile-time constants ────────────────────────────────────────────────
     constexpr int TILE_SIZE        = BQ * HEAD_DIM;
-    constexpr int K_TILES          = HEAD_DIM / MMA_K;    // chunks along head dim
-    constexpr int N_TILES          = BQ / MMA_N;          // col tiles of S (= BQ/8)
-    constexpr int V_COL_TILES      = HEAD_DIM / MMA_N;    // output col tiles
-    constexpr int O_SIZE           = V_COL_TILES * 2;     // floats per row per thread
+    constexpr int K_TILES          = HEAD_DIM / MMA_K;
+    constexpr int N_TILES          = BQ / MMA_N;
+    constexpr int V_COL_TILES      = HEAD_DIM / MMA_N;
+    constexpr int O_SIZE           = V_COL_TILES * 2;
     constexpr int NUM_SCALE_BLOCKS = TILE_SIZE / BLOCK_ELEMENT;
     constexpr int BYTES_PER_REG    = 4;
 
     // ── Shared memory ─────────────────────────────────────────────────────────
-    __shared__ float   staging [TILE_SIZE];
+    __shared__ float   staging [TILE_SIZE];   // K load buffer
     __shared__ uint8_t Q_quant [TILE_SIZE];
     __shared__ uint8_t K_quant [TILE_SIZE];
+    __shared__ float   V_tile  [TILE_SIZE];   // V tile in float32
     __shared__ uint8_t Q_scales[NUM_SCALE_BLOCKS];
     __shared__ uint8_t K_scales[NUM_SCALE_BLOCKS];
 
@@ -105,9 +105,9 @@ __global__ void fused_fp4_attention(
     int warp_id = tid / WARP_SIZE;
     int lane    = tid % WARP_SIZE;
 
-    // ── Load and quantize Q ───────────────────────────────────────────────────
+    // ── Load and quantize Q (once before the K tile loop) ────────────────────
     for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) {
-        int idx   = tid + k;
+        int idx = tid + k;
         staging[idx] = Q[q_base + idx];
     }
     __syncthreads();
@@ -123,24 +123,17 @@ __global__ void fused_fp4_attention(
     }
     __syncthreads();
 
-    // ── Fragment layout (empirically validated — sections 12-15) ─────────────
-    // lane/4  → row base within warp tile (0..7)
-    // lane%4  → K-column subgroup and output-column subgroup (0..3)
-    // a0=(r0,c), a1=(r0+8,c), a2=(r0,c+16), a3=(r0+8,c+16)
+    // ── Fragment layout ───────────────────────────────────────────────────────
     int q_row0 = warp_id * MMA_M + (lane / 4);
     int q_row1 = q_row0 + 8;
 
     const float softmax_scale = 1.0f / sqrtf((float)HEAD_DIM);
 
-    // ── O accumulator array (unnormalized) ───────────────────────────────────
-    // O0[v_col_tile*2 + 0] = output col v_col_tile*MMA_N + (lane%4)*2     for row0
-    // O0[v_col_tile*2 + 1] = output col v_col_tile*MMA_N + (lane%4)*2 + 1 for row0
-    float O0[O_SIZE];
-    float O1[O_SIZE];
+    // ── Output accumulator ────────────────────────────────────────────────────
+    float O0[O_SIZE], O1[O_SIZE];
     #pragma unroll
     for (int t = 0; t < O_SIZE; t++) { O0[t] = 0.f; O1[t] = 0.f; }
 
-    // ── Softmax state (scalar — same for all output columns) ─────────────────
     float m0 = -INFINITY, l0 = 0.f;
     float m1 = -INFINITY, l1 = 0.f;
 
@@ -149,13 +142,21 @@ __global__ void fused_fp4_attention(
     // ── K tile loop ───────────────────────────────────────────────────────────
     for (int seq_tile = 0; seq_tile < num_seq_tiles; seq_tile++)
     {
+        // Load K tile into staging
         for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) {
-            int idx   = tid + k;
-            int g_idx = k_base + seq_tile * TILE_SIZE + idx;
-            staging[idx] = K[g_idx];
+            int idx = tid + k;
+            staging[idx] = K[k_base + seq_tile * TILE_SIZE + idx];
+        }
+
+        // Load V tile into shared memory (coalesced: consecutive tokens,
+        // consecutive head_dim elements)
+        for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) {
+            int idx = tid + k;
+            V_tile[idx] = V[v_base_g + seq_tile * TILE_SIZE + idx];
         }
         __syncthreads();
 
+        // Quantize K tile
         for (int i = tid; i < NUM_SCALE_BLOCKS; i += NUM_THREADS) {
             uint8_t scale = compute_scale_ue8m0(&staging[i * BLOCK_ELEMENT]);
             K_scales[i]   = scale;
@@ -167,7 +168,7 @@ __global__ void fused_fp4_attention(
         }
         __syncthreads();
 
-        // ── MMA: compute S tile ───────────────────────────────────────────────
+        // ── MMA loop ──────────────────────────────────────────────────────────
         for (int n_tile = 0; n_tile < N_TILES; n_tile++)
         {
             float acc[4] = {0.f};
@@ -224,7 +225,6 @@ __global__ void fused_fp4_attention(
                 );
             }
 
-            // Apply 1/sqrt(d) before softmax
             for (int i = 0; i < 4; i++) acc[i] *= softmax_scale;
 
             // ── Online softmax row0 ───────────────────────────────────────────
@@ -257,16 +257,14 @@ __global__ void fused_fp4_attention(
             local_sum1 += __shfl_xor_sync(0xFFFFFFFF, local_sum1, 2);
             float new_l1 = alpha1 * l1 + local_sum1;
 
-            // ── Rescale all O values when m changes ───────────────────────────
-            // Must apply to ALL output columns — this is why O is an array
+            // Rescale O
             #pragma unroll
             for (int t = 0; t < O_SIZE; t++) {
                 O0[t] *= alpha0;
                 O1[t] *= alpha1;
             }
 
-            // ── Fetch softmax weights from lane neighbors (once per n_tile) ───
-            // se0/se1 for row0, se2/se3 for row1 — same for ALL output col tiles
+            // Fetch softmax weights from neighbors
             float se0[4], se1[4], se2[4], se3[4];
             #pragma unroll
             for (int i = 0; i < 4; i++) {
@@ -277,10 +275,8 @@ __global__ void fused_fp4_attention(
                 se3[i] = __shfl_sync(0xFFFFFFFF, e1_c1, src);
             }
 
-            // ── V accumulation across ALL output column tiles ─────────────────
-            // Each v_col_tile covers 8 output columns (MMA_N).
-            // This thread contributes to columns v_col_tile*MMA_N + (lane%4)*2
-            // and v_col_tile*MMA_N + (lane%4)*2 + 1
+            // ── V accumulation from shared memory ─────────────────────────────
+            // V_tile[tok * HEAD_DIM + col] — all accesses hit SMEM now
             #pragma unroll
             for (int vt = 0; vt < V_COL_TILES; vt++) {
                 int out_c = vt * MMA_N + (lane % 4) * 2;
@@ -289,15 +285,19 @@ __global__ void fused_fp4_attention(
 
                 #pragma unroll
                 for (int i = 0; i < 4; i++) {
+                    // local_tok: token index within this seq_tile (0..BQ-1)
                     int local_tok = n_tile * MMA_N + i * 2;
-                    int v_tok     = seq_tile * BQ + local_tok;
-                    int vrow0     = v_base_g + v_tok       * HEAD_DIM;
-                    int vrow1     = v_base_g + (v_tok + 1) * HEAD_DIM;
+                    int vrow0 = local_tok       * HEAD_DIM;
+                    int vrow1 = (local_tok + 1) * HEAD_DIM;
 
-                    p0_c0 += se0[i] * V[vrow0 + out_c]     + se1[i] * V[vrow1 + out_c];
-                    p0_c1 += se0[i] * V[vrow0 + out_c + 1] + se1[i] * V[vrow1 + out_c + 1];
-                    p1_c0 += se2[i] * V[vrow0 + out_c]     + se3[i] * V[vrow1 + out_c];
-                    p1_c1 += se2[i] * V[vrow0 + out_c + 1] + se3[i] * V[vrow1 + out_c + 1];
+                    p0_c0 += se0[i] * V_tile[vrow0 + out_c]
+                           + se1[i] * V_tile[vrow1 + out_c];
+                    p0_c1 += se0[i] * V_tile[vrow0 + out_c + 1]
+                           + se1[i] * V_tile[vrow1 + out_c + 1];
+                    p1_c0 += se2[i] * V_tile[vrow0 + out_c]
+                           + se3[i] * V_tile[vrow1 + out_c];
+                    p1_c1 += se2[i] * V_tile[vrow0 + out_c + 1]
+                           + se3[i] * V_tile[vrow1 + out_c + 1];
                 }
 
                 O0[vt * 2]     += p0_c0;
@@ -313,7 +313,7 @@ __global__ void fused_fp4_attention(
         __syncthreads();
     }
 
-    // ── Normalize O by l and write output ─────────────────────────────────────
+    // ── Normalize and write output ────────────────────────────────────────────
     int out_base0 = o_base + q_row0 * HEAD_DIM;
     int out_base1 = o_base + q_row1 * HEAD_DIM;
 
